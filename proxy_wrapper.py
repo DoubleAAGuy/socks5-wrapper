@@ -17,6 +17,19 @@ VERSION = "1.0"
 CHROMIUM_STEMS = {"chrome", "chromium", "msedge", "brave", "vivaldi", "opera", "thorium"}
 FIREFOX_STEMS = {"firefox", "librewolf", "waterfox", "palemoon", "tor"}
 
+# Programs measured to ignore the proxy env vars and connect directly anyway.
+# Launching these under a proxy the user believes is active is worse than not
+# launching them, so they are refused unless --force is given.
+NO_SOCKS_SUPPORT = {
+    "powershell": "Windows PowerShell (.NET Framework) uses WinINET settings, "
+                  "not proxy env vars, and has no SOCKS support.",
+    "pwsh": "PowerShell 7 honours HTTP(S)_PROXY but not SOCKS proxies.",
+    "node": "Node's undici rejects socks5:// proxy URLs outright "
+            "(\"URL must start with http: or https:\").",
+    "npm": "npm/node cannot route through a SOCKS proxy via env vars.",
+    "dotnet": ".NET honours HTTP(S)_PROXY but not SOCKS via env vars.",
+}
+
 # Where browsers commonly live, used to resolve a bare name like "chrome.exe".
 KNOWN_PATHS = {
     "chrome": [
@@ -53,6 +66,8 @@ def usage():
         "  --args=\"...\"                 arguments to pass to the program\n"
         "  --keep-profile               reuse a persistent browser profile\n"
         "  --wait                       wait for the program to exit\n"
+        "  --force                      launch even if the program cannot use SOCKS\n"
+        "                               (it will connect directly - real IP exposed)\n"
         "  --                           everything after this goes to the program\n\n"
         "Example:\n"
         "  proxy_wrapper.exe --proxy=127.0.0.1:1080 --target_program=chrome.exe\n"
@@ -96,6 +111,7 @@ def parse_args(argv):
         "extra": [],
         "keep_profile": False,
         "wait": False,
+        "force": False,
     }
     i = 0
     while i < len(argv):
@@ -117,6 +133,8 @@ def parse_args(argv):
             opts["extra"].extend(split_args(a.split("=", 1)[1]))
         elif a == "--keep-profile":
             opts["keep_profile"] = True
+        elif a == "--force":
+            opts["force"] = True
         elif a == "--wait":
             opts["wait"] = True
         elif a in ("-h", "--help"):
@@ -232,6 +250,33 @@ def build_firefox(exe, host, port, extra, keep):
     return cmd, (profile if temporary else None)
 
 
+def warn_env_mode(stem, exe, force):
+    """Env-var mode is opt-in on the program's side; say so plainly.
+
+    Measured against a live SOCKS5 proxy: curl and git honour these variables,
+    while powershell and node ignore them entirely and connect directly. The
+    dangerous case is the latter, because nothing about the launch looks wrong.
+    """
+    name = os.path.basename(exe)
+    if stem in NO_SOCKS_SUPPORT:
+        log("")
+        if force:
+            log("WARNING: launching %s UNPROXIED (--force)." % name)
+            log("  %s" % NO_SOCKS_SUPPORT[stem])
+            log("  It is connecting DIRECTLY. Your real IP is exposed.")
+        else:
+            log("REFUSING to launch %s: it CANNOT use a SOCKS5 proxy." % name)
+            log("  %s" % NO_SOCKS_SUPPORT[stem])
+            log("  It would connect DIRECTLY and expose your real IP while looking fine.")
+            log("  Re-run with --force to launch it anyway, unproxied.")
+        log("")
+        return
+    log("note: %s is not a known browser, so it gets proxy env vars." % name)
+    log("      These only work for programs that honour them (curl, git, and")
+    log("      other libcurl-based tools). Verify before trusting it:")
+    log("      compare `curl https://api.ipify.org` against this program's egress.")
+
+
 def std_handles():
     """Hand our stdout/stderr to the child explicitly.
 
@@ -261,27 +306,31 @@ def main(argv):
     stem = os.path.splitext(os.path.basename(exe))[0].lower()
     cleanup = None
 
+    # Env vars go to every mode, not just the fallback: a browser's own traffic
+    # is handled by its native flags, but any helper exe it spawns has only the
+    # environment to go on.
+    env = proxy_env(host, port, user, password)
+
     if stem in CHROMIUM_STEMS:
         mode = "chromium native SOCKS5"
         cmd, cleanup = build_chromium(exe, host, port, user, opts["extra"],
                                       opts["keep_profile"])
-        env = os.environ.copy()
     elif stem in FIREFOX_STEMS:
         mode = "firefox profile SOCKS5"
         cmd, cleanup = build_firefox(exe, host, port, opts["extra"],
                                      opts["keep_profile"])
-        env = os.environ.copy()
     else:
         mode = "proxy environment variables"
         cmd = [exe] + opts["extra"]
-        env = proxy_env(host, port, user, password)
-        log("note: %s is not a known browser. Applying proxy env vars, which only"
-            % os.path.basename(exe))
-        log("      work for programs that honour them (curl, git, requests, ...).")
 
     log("proxy   : socks5://%s:%d" % (host, port))
     log("program : %s" % exe)
     log("mode    : %s" % mode)
+
+    if mode == "proxy environment variables":
+        warn_env_mode(stem, exe, opts["force"])
+        if stem in NO_SOCKS_SUPPORT and not opts["force"]:
+            return 3
 
     try:
         proc = subprocess.Popen(cmd, env=env, **std_handles())
