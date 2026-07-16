@@ -59,6 +59,12 @@ the real one:
 | Windows PowerShell | **cannot be proxied** — refused |
 | Node.js | **cannot be proxied** — refused |
 | Python `urllib` | fails — no SOCKS support in stdlib |
+| Python raw `socket` | **leaks the real IP** — env vars cannot reach the socket layer |
+
+That last row is the clearest statement of the limit: a program opening a raw
+socket connects directly no matter what the environment says. Python is not
+refused, because Python code *can* proxy correctly (`requests` + `PySocks`) —
+but whether it does is up to the code, not this wrapper.
 
 Verified by negative control: with a dead proxy port, curl and git **fail**
 (rc=7 / rc=128) rather than silently falling back to a direct connection.
